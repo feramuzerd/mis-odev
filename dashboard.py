@@ -435,8 +435,9 @@ def page_kredi():
         with st.expander("Detay Tablosu"):
             tablo = tum_donemler[["donem", "odeme_m", "kalan_risk_m"]].copy()
             tablo.columns = ["Donem", "Donem Odemesi (M TL)", "Kalan Risk (M TL)"]
-            tablo.insert(0, "Baslangic Risk (M TL)", round(toplam_risk / 1e6, 1))
-            tablo.loc[tablo.index[1:], "Baslangic Risk (M TL)"] = ""
+            baslangic_col = [""] * len(tablo)
+            baslangic_col[0] = str(round(toplam_risk / 1e6, 1))
+            tablo.insert(0, "Baslangic Risk (M TL)", baslangic_col)
             st.dataframe(tablo, use_container_width=True, hide_index=True)
     else:
         st.info("Gelecek donemde odeme bulunamadi.")
