@@ -4,7 +4,7 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from datetime import datetime
+from datetime import datetime, timedelta
 
 st.set_page_config(page_title="MIS Dashboard", layout="wide")
 
@@ -330,6 +330,116 @@ def page_kredi():
                           "odeme_sablonu": "Odeme Sablonu"})
     fig.update_layout(height=500, xaxis_tickangle=-45)
     st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+
+    # 5. Gelecek Odemelere Gore Kalan Kredi Riski Projeksiyonu
+    st.subheader("Gelecek Odemelere Gore Kalan Kredi Riski")
+
+    AY_ISIMLERI = {1: "Ocak", 2: "Subat", 3: "Mart", 4: "Nisan", 5: "Mayis", 6: "Haziran",
+                   7: "Temmuz", 8: "Agustos", 9: "Eylul", 10: "Ekim", 11: "Kasim", 12: "Aralik"}
+
+    SABLON_MAP = {
+        "720_gun_4_taksit": (720, 4), "360_gun_2_taksit": (360, 2),
+        "5_yil_9_taksit": (1825, 9), "7_yil_9_taksit": (2555, 9),
+        "360_gun_tek_taksit": (360, 1),
+    }
+
+    ref_tarih = datetime(2026, 3, 1)
+
+    # Her kredi icin gelecek taksit tarihlerini ve odeme tutarlarini hesapla
+    odeme_rows = []
+    for _, row in df.iterrows():
+        sablon = SABLON_MAP.get(row["odeme_sablonu"])
+        if sablon is None or row["anapara_risk"] <= 0:
+            continue
+        gun, taksit_sayisi = sablon
+        valor_dt = pd.to_datetime(row["valor"])
+        taksit_araligi = gun / taksit_sayisi
+
+        gelecek_tarihler = []
+        for t in range(taksit_sayisi):
+            taksit_dt = valor_dt + timedelta(days=int(taksit_araligi * (t + 1)))
+            if taksit_dt > ref_tarih:
+                gelecek_tarihler.append(taksit_dt)
+
+        if not gelecek_tarihler:
+            continue
+
+        taksit_tutar = row["anapara_risk"] / len(gelecek_tarihler)
+        for dt in gelecek_tarihler:
+            odeme_rows.append({"tarih": dt, "odeme": taksit_tutar})
+
+    if odeme_rows:
+        odeme_df = pd.DataFrame(odeme_rows)
+        odeme_df["tarih"] = pd.to_datetime(odeme_df["tarih"])
+
+        # Ay ve ceyrek bilgisi ekle
+        odeme_df["yil"] = odeme_df["tarih"].dt.year
+        odeme_df["ay"] = odeme_df["tarih"].dt.month
+
+        # Ilk 4 ay siniri
+        ay4_sinir = ref_tarih + timedelta(days=120)
+
+        # Aylik odemeler (ilk 4 ay)
+        aylik = odeme_df[odeme_df["tarih"] < ay4_sinir].copy()
+        aylik_grp = aylik.groupby(["yil", "ay"])["odeme"].sum().reset_index()
+        aylik_grp["donem"] = aylik_grp.apply(
+            lambda r: f"{AY_ISIMLERI[int(r['ay'])]} {int(r['yil'])}", axis=1)
+        aylik_grp["sira"] = aylik_grp["yil"] * 100 + aylik_grp["ay"]
+
+        # Ceyreklik odemeler (4 aydan sonrasi)
+        ceyreklik = odeme_df[odeme_df["tarih"] >= ay4_sinir].copy()
+        ceyreklik["ceyrek"] = ceyreklik["tarih"].dt.to_period("Q")
+        ceyrek_grp = ceyreklik.groupby("ceyrek")["odeme"].sum().reset_index()
+        ceyrek_grp["donem"] = ceyrek_grp["ceyrek"].astype(str)
+        ceyrek_grp["sira"] = range(90000, 90000 + len(ceyrek_grp))
+
+        # Birlestir
+        tum_donemler = pd.concat([
+            aylik_grp[["donem", "odeme", "sira"]],
+            ceyrek_grp[["donem", "odeme", "sira"]],
+        ]).sort_values("sira").reset_index(drop=True)
+
+        # Kumulatif kalan risk hesapla
+        toplam_risk = df["anapara_risk"].sum()
+        tum_donemler["kumulatif_odeme"] = tum_donemler["odeme"].cumsum()
+        tum_donemler["kalan_risk"] = toplam_risk - tum_donemler["kumulatif_odeme"]
+        tum_donemler["kalan_risk_m"] = (tum_donemler["kalan_risk"] / 1e6).round(1)
+        tum_donemler["odeme_m"] = (tum_donemler["odeme"] / 1e6).round(1)
+
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=tum_donemler["donem"], y=tum_donemler["kalan_risk_m"],
+                mode="lines+markers+text", name="Kalan Risk",
+                line=dict(color="#EF553B", width=3),
+                text=tum_donemler["kalan_risk_m"], textposition="top center",
+                fill="tozeroy", fillcolor="rgba(239,85,59,0.1)",
+            ))
+            fig.update_layout(
+                height=500, yaxis_title="Kalan Risk (M TL)", xaxis_title="",
+                xaxis_tickangle=-45,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        with c2:
+            fig = px.bar(tum_donemler, x="donem", y="odeme_m",
+                         labels={"donem": "", "odeme_m": "Odeme (M TL)"},
+                         color_discrete_sequence=["#00CC96"], text="odeme_m")
+            fig.update_traces(textposition="outside")
+            fig.update_layout(height=500, xaxis_tickangle=-45)
+            st.plotly_chart(fig, use_container_width=True)
+
+        # Tablo
+        with st.expander("Detay Tablosu"):
+            tablo = tum_donemler[["donem", "odeme_m", "kalan_risk_m"]].copy()
+            tablo.columns = ["Donem", "Donem Odemesi (M TL)", "Kalan Risk (M TL)"]
+            tablo.insert(0, "Baslangic Risk (M TL)", round(toplam_risk / 1e6, 1))
+            tablo.loc[tablo.index[1:], "Baslangic Risk (M TL)"] = ""
+            st.dataframe(tablo, use_container_width=True, hide_index=True)
+    else:
+        st.info("Gelecek donemde odeme bulunamadi.")
 
 
 # ============================================================
