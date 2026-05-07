@@ -43,9 +43,21 @@ risk_full["ceyrek"] = risk_full["valor_dt"].dt.to_period("Q").astype(str)
 # ============================================================
 if "page" not in st.session_state:
     st.session_state.page = "ana_sayfa"
+if "drill_region" not in st.session_state:
+    st.session_state.drill_region = None
+if "drill_sube" not in st.session_state:
+    st.session_state.drill_sube = None
+if "drill_portfoy" not in st.session_state:
+    st.session_state.drill_portfoy = None
 
-def go_to(page):
+def go_to(page, region=None, sube=None, portfoy=None):
     st.session_state.page = page
+    if region is not None:
+        st.session_state.drill_region = region
+    if sube is not None:
+        st.session_state.drill_sube = sube
+    if portfoy is not None:
+        st.session_state.drill_portfoy = portfoy
 
 # ============================================================
 # FILTRE FONKSIYONU (sidebar)
@@ -68,10 +80,10 @@ def render_filters(df, prefix="main"):
         mask &= df["kobi_flg"].isin(kobi)
     return mask
 
-def back_button():
+def back_button(target="ana_sayfa", label="Ana Sayfaya Don", **kwargs):
     st.sidebar.markdown("---")
-    if st.sidebar.button("Ana Sayfaya Don", use_container_width=True):
-        go_to("ana_sayfa")
+    if st.sidebar.button(label, use_container_width=True, key=f"back_{target}"):
+        go_to(target, **kwargs)
         st.rerun()
 
 # ============================================================
@@ -136,6 +148,86 @@ def page_kredi():
     col2.metric("Toplam Anapara Risk", f"{df['anapara_risk'].sum()/1e6:,.1f} M")
     col3.metric("Toplam Faiz Risk", f"{df['faiz_risk'].sum()/1e6:,.1f} M")
     col4.metric("Yapilandirma Adedi", f"{df[df['yapilandirma']==1].shape[0]:,}")
+
+    st.markdown("---")
+
+    # --- Kredi Kullandirim: Region Bazinda (drill-down) ---
+    st.subheader("Kredi Kullandirim - Bolge Bazinda")
+    st.caption("Bolgeye tiklayin detay icin")
+    kull_mask = pd.Series(True, index=credit_full.index)
+    if st.session_state.get("kredi_portfoy"):
+        kull_mask &= credit_full["portfoy"].isin(st.session_state["kredi_portfoy"])
+    if st.session_state.get("kredi_sube"):
+        kull_mask &= credit_full["sube"].isin(st.session_state["kredi_sube"])
+    if st.session_state.get("kredi_bolge"):
+        kull_mask &= credit_full["region"].isin(st.session_state["kredi_bolge"])
+    if st.session_state.get("kredi_kobi"):
+        kull_mask &= credit_full["kobi_flg"].isin(st.session_state["kredi_kobi"])
+    kull_df = credit_full[kull_mask].copy()
+    kull_region = kull_df.groupby("region").agg(
+        kullandirim=("lcy_tutar", "sum"), adet=("krd_id", "count")
+    ).reset_index()
+    kull_region["kullandirim_m"] = (kull_region["kullandirim"] / 1e6).round(1)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.bar(kull_region.sort_values("kullandirim_m", ascending=True),
+                     x="kullandirim_m", y="region", orientation="h",
+                     labels={"region": "Bolge", "kullandirim_m": "Kullandirim (M TL)"},
+                     color="region", text="kullandirim_m")
+        fig.update_traces(textposition="outside")
+        fig.update_layout(height=350, showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        fig = px.pie(kull_region, values="adet", names="region",
+                     title="Kullandirim Adet Dagilimi", hole=0.4)
+        fig.update_layout(height=350)
+        st.plotly_chart(fig, use_container_width=True)
+
+    cols = st.columns(len(kull_region))
+    for i, row in enumerate(kull_region.sort_values("region").itertuples()):
+        with cols[i]:
+            if st.button(f"{row.region}", key=f"kull_reg_{row.region}", use_container_width=True):
+                go_to("kredi_kull_region", region=row.region)
+                st.rerun()
+
+    st.markdown("---")
+
+    # --- Kredi Risk: Region Bazinda (drill-down) ---
+    st.subheader("Kredi Risk - Bolge Bazinda")
+    st.caption("Bolgeye tiklayin detay icin")
+    risk_region = df.groupby("region").agg(
+        anapara_risk=("anapara_risk", "sum"),
+        faiz_risk=("faiz_risk", "sum"),
+        adet=("krd_id", "count"),
+    ).reset_index()
+    risk_region["anapara_risk_m"] = (risk_region["anapara_risk"] / 1e6).round(1)
+    risk_region["faiz_risk_m"] = (risk_region["faiz_risk"] / 1e6).round(1)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.bar(
+            risk_region.melt(id_vars="region", value_vars=["anapara_risk_m", "faiz_risk_m"],
+                             var_name="tip", value_name="tutar"),
+            x="region", y="tutar", color="tip", barmode="group",
+            labels={"region": "Bolge", "tutar": "Milyon TL", "tip": "Risk Tipi"},
+            color_discrete_map={"anapara_risk_m": "#EF553B", "faiz_risk_m": "#636EFA"},
+        )
+        fig.for_each_trace(lambda t: t.update(name="Anapara" if "anapara" in t.name else "Faiz"))
+        fig.update_layout(height=350)
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        fig = px.pie(risk_region, values="adet", names="region",
+                     title="Risk Adet Dagilimi", hole=0.4)
+        fig.update_layout(height=350)
+        st.plotly_chart(fig, use_container_width=True)
+
+    cols = st.columns(len(risk_region))
+    for i, row in enumerate(risk_region.sort_values("region").itertuples()):
+        with cols[i]:
+            if st.button(f"{row.region}", key=f"risk_reg_{row.region}", use_container_width=True):
+                go_to("kredi_risk_region", region=row.region)
+                st.rerun()
 
     st.markdown("---")
 
@@ -214,7 +306,6 @@ def page_kredi():
         fig.update_layout(height=350, showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
     with c2:
-        # programa gore yapilandirma
         yapil_prog = yapil[yapil["yapilandirma"] == 1].groupby("krd_program").agg(
             anapara_risk=("anapara_risk", "sum"), adet=("krd_id", "count")
         ).reset_index()
@@ -239,6 +330,443 @@ def page_kredi():
                           "odeme_sablonu": "Odeme Sablonu"})
     fig.update_layout(height=500, xaxis_tickangle=-45)
     st.plotly_chart(fig, use_container_width=True)
+
+
+# ============================================================
+# KREDI KULLANDIRIM DRILL-DOWN SAYFALARI
+# ============================================================
+def page_kredi_kull_region():
+    region = st.session_state.drill_region
+    st.title(f"Kredi Kullandirim - {region} Bolgesi")
+    back_button(target="kredi", label="Kredi Sayfasina Don")
+
+    df = credit_full[credit_full["region"] == region].copy()
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Kredi Adedi", f"{len(df):,}")
+    col2.metric("Toplam Kullandirim", f"{df['lcy_tutar'].sum()/1e6:,.1f} M TL")
+    col3.metric("USD Kullandirim", f"{df['usd_tutar'].sum()/1e6:,.1f} M USD")
+
+    st.markdown("---")
+
+    # Sube bazinda
+    st.subheader("Sube Bazinda Kullandirim")
+    st.caption("Subeye tiklayin detay icin")
+    sube_grp = df.groupby("sube").agg(
+        kullandirim=("lcy_tutar", "sum"), usd_kullandirim=("usd_tutar", "sum"), adet=("krd_id", "count")
+    ).reset_index()
+    sube_grp["kullandirim_m"] = (sube_grp["kullandirim"] / 1e6).round(1)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.bar(sube_grp.sort_values("kullandirim_m", ascending=True),
+                     x="kullandirim_m", y="sube", orientation="h",
+                     labels={"sube": "Sube", "kullandirim_m": "Kullandirim (M TL)"},
+                     color="sube", text="kullandirim_m")
+        fig.update_traces(textposition="outside")
+        fig.update_layout(height=400, showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        fig = px.pie(sube_grp, values="adet", names="sube",
+                     title="Adet Dagilimi", hole=0.4)
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+
+    cols = st.columns(len(sube_grp))
+    for i, row in enumerate(sube_grp.sort_values("sube").itertuples()):
+        with cols[i]:
+            if st.button(f"{row.sube}", key=f"kull_sube_{row.sube}", use_container_width=True):
+                go_to("kredi_kull_sube", sube=row.sube)
+                st.rerun()
+
+    st.markdown("---")
+
+    # Programa gore
+    st.subheader("Programa Gore Kullandirim")
+    prog = df.groupby("krd_program").agg(
+        kullandirim=("lcy_tutar", "sum"), adet=("krd_id", "count")
+    ).reset_index()
+    prog["kullandirim_m"] = (prog["kullandirim"] / 1e6).round(1)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.bar(prog, x="krd_program", y="kullandirim_m",
+                     labels={"krd_program": "Program", "kullandirim_m": "Kullandirim (M TL)"},
+                     color="krd_program", text="kullandirim_m")
+        fig.update_traces(textposition="outside")
+        fig.update_layout(height=400, showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        fig = px.pie(prog, values="adet", names="krd_program",
+                     title="Program Adet Dagilimi", hole=0.4)
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+
+    # Para birimi dagilimi
+    st.subheader("Para Birimi Dagilimi")
+    pb_grp = df.groupby("para_birimi").agg(
+        kullandirim=("lcy_tutar", "sum"), adet=("krd_id", "count")
+    ).reset_index()
+    pb_grp["kullandirim_m"] = (pb_grp["kullandirim"] / 1e6).round(1)
+    fig = px.bar(pb_grp, x="para_birimi", y="kullandirim_m", color="para_birimi",
+                 labels={"para_birimi": "Para Birimi", "kullandirim_m": "Kullandirim (M TL)"},
+                 text="kullandirim_m")
+    fig.update_traces(textposition="outside")
+    fig.update_layout(height=400, showlegend=False)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def page_kredi_kull_sube():
+    sube = st.session_state.drill_sube
+    region = st.session_state.drill_region
+    st.title(f"Kredi Kullandirim - {sube} Subesi")
+    back_button(target="kredi_kull_region", label=f"{region} Bolgesine Don", region=region)
+
+    df = credit_full[credit_full["sube"] == sube].copy()
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Kredi Adedi", f"{len(df):,}")
+    col2.metric("Toplam Kullandirim", f"{df['lcy_tutar'].sum()/1e6:,.1f} M TL")
+    col3.metric("USD Kullandirim", f"{df['usd_tutar'].sum()/1e6:,.1f} M USD")
+
+    st.markdown("---")
+
+    # Portfoy bazinda
+    st.subheader("Portfoy Bazinda Kullandirim")
+    st.caption("Portfoye tiklayin detay icin")
+    port_grp = df.groupby("portfoy").agg(
+        kullandirim=("lcy_tutar", "sum"), usd_kullandirim=("usd_tutar", "sum"), adet=("krd_id", "count")
+    ).reset_index()
+    port_grp["kullandirim_m"] = (port_grp["kullandirim"] / 1e6).round(1)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.bar(port_grp.sort_values("kullandirim_m", ascending=True),
+                     x="kullandirim_m", y="portfoy", orientation="h",
+                     labels={"portfoy": "Portfoy Yoneticisi", "kullandirim_m": "Kullandirim (M TL)"},
+                     color="portfoy", text="kullandirim_m")
+        fig.update_traces(textposition="outside")
+        fig.update_layout(height=max(400, len(port_grp) * 40), showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        fig = px.pie(port_grp, values="adet", names="portfoy",
+                     title="Adet Dagilimi", hole=0.4)
+        fig.update_layout(height=max(400, len(port_grp) * 40))
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Portfoy butonlari (3'er sutun)
+    port_list = sorted(port_grp["portfoy"].unique())
+    for row_start in range(0, len(port_list), 3):
+        cols = st.columns(3)
+        for j, col in enumerate(cols):
+            idx = row_start + j
+            if idx < len(port_list):
+                with col:
+                    if st.button(port_list[idx], key=f"kull_port_{port_list[idx]}", use_container_width=True):
+                        go_to("kredi_kull_portfoy", portfoy=port_list[idx])
+                        st.rerun()
+
+    st.markdown("---")
+
+    # Programa gore
+    st.subheader("Programa Gore Kullandirim")
+    prog = df.groupby("krd_program").agg(
+        kullandirim=("lcy_tutar", "sum"), adet=("krd_id", "count")
+    ).reset_index()
+    prog["kullandirim_m"] = (prog["kullandirim"] / 1e6).round(1)
+    fig = px.bar(prog, x="krd_program", y="kullandirim_m", color="krd_program",
+                 labels={"krd_program": "Program", "kullandirim_m": "Kullandirim (M TL)"},
+                 text="kullandirim_m")
+    fig.update_traces(textposition="outside")
+    fig.update_layout(height=400, showlegend=False)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def page_kredi_kull_portfoy():
+    portfoy = st.session_state.drill_portfoy
+    sube = st.session_state.drill_sube
+    region = st.session_state.drill_region
+    st.title(f"Kredi Kullandirim - {portfoy}")
+    back_button(target="kredi_kull_sube", label=f"{sube} Subesine Don", sube=sube)
+
+    df = credit_full[(credit_full["portfoy"] == portfoy) & (credit_full["sube"] == sube)].copy()
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Kredi Adedi", f"{len(df):,}")
+    col2.metric("Toplam Kullandirim", f"{df['lcy_tutar'].sum()/1e6:,.1f} M TL")
+    col3.metric("USD Kullandirim", f"{df['usd_tutar'].sum()/1e6:,.1f} M USD")
+
+    st.markdown("---")
+
+    # Programa gore
+    st.subheader("Programa Gore Kullandirim")
+    prog = df.groupby("krd_program").agg(
+        kullandirim=("lcy_tutar", "sum"), adet=("krd_id", "count")
+    ).reset_index()
+    prog["kullandirim_m"] = (prog["kullandirim"] / 1e6).round(1)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.bar(prog, x="krd_program", y="kullandirim_m", color="krd_program",
+                     labels={"krd_program": "Program", "kullandirim_m": "Kullandirim (M TL)"},
+                     text="kullandirim_m")
+        fig.update_traces(textposition="outside")
+        fig.update_layout(height=400, showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        fig = px.pie(prog, values="adet", names="krd_program",
+                     title="Program Adet Dagilimi", hole=0.4)
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+
+    # Ceyreklik kullandirim trendi
+    st.subheader("Ceyreklik Kullandirim Trendi")
+    ceyrek_grp = df.groupby("ceyrek").agg(
+        kullandirim=("lcy_tutar", "sum"), adet=("krd_id", "count")
+    ).reset_index()
+    ceyrek_grp["kullandirim_m"] = (ceyrek_grp["kullandirim"] / 1e6).round(1)
+    fig = px.bar(ceyrek_grp, x="ceyrek", y="kullandirim_m",
+                 labels={"ceyrek": "Ceyrek", "kullandirim_m": "Kullandirim (M TL)"},
+                 text="kullandirim_m", color_discrete_sequence=["#636EFA"])
+    fig.update_traces(textposition="outside")
+    fig.update_layout(height=400, xaxis_tickangle=-45)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+
+    # Kredi detay tablosu
+    st.subheader("Kredi Detaylari")
+    st.dataframe(
+        df[["krd_id", "mno", "lcy_tutar", "usd_tutar", "para_birimi", "valor", "vade",
+            "krd_program", "odeme_sablonu", "yapilandirma"]].sort_values("lcy_tutar", ascending=False),
+        use_container_width=True, height=400
+    )
+
+
+# ============================================================
+# KREDI RISK DRILL-DOWN SAYFALARI
+# ============================================================
+def page_kredi_risk_region():
+    region = st.session_state.drill_region
+    st.title(f"Kredi Risk - {region} Bolgesi")
+    back_button(target="kredi", label="Kredi Sayfasina Don")
+
+    df = risk_full[risk_full["region"] == region].copy()
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Kredi Adedi", f"{len(df):,}")
+    col2.metric("Anapara Risk", f"{df['anapara_risk'].sum()/1e6:,.1f} M")
+    col3.metric("Faiz Risk", f"{df['faiz_risk'].sum()/1e6:,.1f} M")
+    col4.metric("Yapilandirma", f"{df[df['yapilandirma']==1].shape[0]:,}")
+
+    st.markdown("---")
+
+    # Sube bazinda
+    st.subheader("Sube Bazinda Risk")
+    st.caption("Subeye tiklayin detay icin")
+    sube_grp = df.groupby("sube").agg(
+        anapara_risk=("anapara_risk", "sum"),
+        faiz_risk=("faiz_risk", "sum"),
+        adet=("krd_id", "count"),
+    ).reset_index()
+    sube_grp["anapara_risk_m"] = (sube_grp["anapara_risk"] / 1e6).round(1)
+    sube_grp["faiz_risk_m"] = (sube_grp["faiz_risk"] / 1e6).round(1)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.bar(
+            sube_grp.melt(id_vars="sube", value_vars=["anapara_risk_m", "faiz_risk_m"],
+                          var_name="tip", value_name="tutar"),
+            x="sube", y="tutar", color="tip", barmode="group",
+            labels={"sube": "Sube", "tutar": "Milyon TL", "tip": "Risk Tipi"},
+            color_discrete_map={"anapara_risk_m": "#EF553B", "faiz_risk_m": "#636EFA"},
+        )
+        fig.for_each_trace(lambda t: t.update(name="Anapara" if "anapara" in t.name else "Faiz"))
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        fig = px.pie(sube_grp, values="adet", names="sube",
+                     title="Risk Adet Dagilimi", hole=0.4)
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+
+    cols = st.columns(len(sube_grp))
+    for i, row in enumerate(sube_grp.sort_values("sube").itertuples()):
+        with cols[i]:
+            if st.button(f"{row.sube}", key=f"risk_sube_{row.sube}", use_container_width=True):
+                go_to("kredi_risk_sube", sube=row.sube)
+                st.rerun()
+
+    st.markdown("---")
+
+    # Programa gore risk
+    st.subheader("Programa Gore Risk")
+    prog = df.groupby("krd_program").agg(
+        anapara_risk=("anapara_risk", "sum"), faiz_risk=("faiz_risk", "sum"), adet=("krd_id", "count")
+    ).reset_index()
+    prog["anapara_risk_m"] = (prog["anapara_risk"] / 1e6).round(1)
+    prog["faiz_risk_m"] = (prog["faiz_risk"] / 1e6).round(1)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = go.Figure()
+        fig.add_trace(go.Bar(name="Anapara", x=prog["krd_program"], y=prog["anapara_risk_m"], marker_color="#EF553B"))
+        fig.add_trace(go.Bar(name="Faiz", x=prog["krd_program"], y=prog["faiz_risk_m"], marker_color="#636EFA"))
+        fig.update_layout(barmode="group", height=400, yaxis_title="Milyon TL")
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        fig = px.pie(prog, values="adet", names="krd_program",
+                     title="Program Adet Dagilimi", hole=0.4)
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def page_kredi_risk_sube():
+    sube = st.session_state.drill_sube
+    region = st.session_state.drill_region
+    st.title(f"Kredi Risk - {sube} Subesi")
+    back_button(target="kredi_risk_region", label=f"{region} Bolgesine Don", region=region)
+
+    df = risk_full[risk_full["sube"] == sube].copy()
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Kredi Adedi", f"{len(df):,}")
+    col2.metric("Anapara Risk", f"{df['anapara_risk'].sum()/1e6:,.1f} M")
+    col3.metric("Faiz Risk", f"{df['faiz_risk'].sum()/1e6:,.1f} M")
+    col4.metric("Yapilandirma", f"{df[df['yapilandirma']==1].shape[0]:,}")
+
+    st.markdown("---")
+
+    # Portfoy bazinda
+    st.subheader("Portfoy Bazinda Risk")
+    st.caption("Portfoye tiklayin detay icin")
+    port_grp = df.groupby("portfoy").agg(
+        anapara_risk=("anapara_risk", "sum"),
+        faiz_risk=("faiz_risk", "sum"),
+        adet=("krd_id", "count"),
+    ).reset_index()
+    port_grp["anapara_risk_m"] = (port_grp["anapara_risk"] / 1e6).round(1)
+    port_grp["faiz_risk_m"] = (port_grp["faiz_risk"] / 1e6).round(1)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.bar(port_grp.sort_values("anapara_risk_m", ascending=True),
+                     x="anapara_risk_m", y="portfoy", orientation="h",
+                     labels={"portfoy": "Portfoy Yoneticisi", "anapara_risk_m": "Anapara Risk (M TL)"},
+                     color="portfoy", text="anapara_risk_m")
+        fig.update_traces(textposition="outside")
+        fig.update_layout(height=max(400, len(port_grp) * 40), showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        fig = px.pie(port_grp, values="adet", names="portfoy",
+                     title="Risk Adet Dagilimi", hole=0.4)
+        fig.update_layout(height=max(400, len(port_grp) * 40))
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Portfoy butonlari
+    port_list = sorted(port_grp["portfoy"].unique())
+    for row_start in range(0, len(port_list), 3):
+        cols = st.columns(3)
+        for j, col in enumerate(cols):
+            idx = row_start + j
+            if idx < len(port_list):
+                with col:
+                    if st.button(port_list[idx], key=f"risk_port_{port_list[idx]}", use_container_width=True):
+                        go_to("kredi_risk_portfoy", portfoy=port_list[idx])
+                        st.rerun()
+
+    st.markdown("---")
+
+    # Yapilandirma dagilimi
+    st.subheader("Yapilandirma Durumu")
+    yapil = df.copy()
+    yapil["yapil_label"] = yapil["yapilandirma"].map({0: "Normal", 1: "Yapilandirma"})
+    yapil_grp = yapil.groupby("yapil_label").agg(
+        anapara_risk=("anapara_risk", "sum"), adet=("krd_id", "count")
+    ).reset_index()
+    yapil_grp["anapara_risk_m"] = (yapil_grp["anapara_risk"] / 1e6).round(1)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.bar(yapil_grp, x="yapil_label", y="anapara_risk_m", color="yapil_label",
+                     labels={"yapil_label": "", "anapara_risk_m": "Anapara Risk (M TL)"},
+                     color_discrete_map={"Normal": "#636EFA", "Yapilandirma": "#EF553B"})
+        fig.update_layout(height=350, showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        fig = px.pie(yapil_grp, values="adet", names="yapil_label",
+                     title="Adet Dagilimi", hole=0.4,
+                     color_discrete_map={"Normal": "#636EFA", "Yapilandirma": "#EF553B"})
+        fig.update_layout(height=350)
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def page_kredi_risk_portfoy():
+    portfoy = st.session_state.drill_portfoy
+    sube = st.session_state.drill_sube
+    region = st.session_state.drill_region
+    st.title(f"Kredi Risk - {portfoy}")
+    back_button(target="kredi_risk_sube", label=f"{sube} Subesine Don", sube=sube)
+
+    df = risk_full[(risk_full["portfoy"] == portfoy) & (risk_full["sube"] == sube)].copy()
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Kredi Adedi", f"{len(df):,}")
+    col2.metric("Anapara Risk", f"{df['anapara_risk'].sum()/1e6:,.1f} M")
+    col3.metric("Faiz Risk", f"{df['faiz_risk'].sum()/1e6:,.1f} M")
+    col4.metric("Yapilandirma", f"{df[df['yapilandirma']==1].shape[0]:,}")
+
+    st.markdown("---")
+
+    # Programa gore risk
+    st.subheader("Programa Gore Risk")
+    prog = df.groupby("krd_program").agg(
+        anapara_risk=("anapara_risk", "sum"), faiz_risk=("faiz_risk", "sum"), adet=("krd_id", "count")
+    ).reset_index()
+    prog["anapara_risk_m"] = (prog["anapara_risk"] / 1e6).round(1)
+    prog["faiz_risk_m"] = (prog["faiz_risk"] / 1e6).round(1)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = go.Figure()
+        fig.add_trace(go.Bar(name="Anapara", x=prog["krd_program"], y=prog["anapara_risk_m"], marker_color="#EF553B"))
+        fig.add_trace(go.Bar(name="Faiz", x=prog["krd_program"], y=prog["faiz_risk_m"], marker_color="#636EFA"))
+        fig.update_layout(barmode="group", height=400, yaxis_title="Milyon TL")
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        fig = px.pie(prog, values="adet", names="krd_program",
+                     title="Program Adet Dagilimi", hole=0.4)
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+
+    # Ceyreklik risk trendi
+    st.subheader("Ceyreklik Risk Trendi")
+    ceyrek_grp = df.groupby("ceyrek").agg(
+        anapara_risk=("anapara_risk", "sum"), faiz_risk=("faiz_risk", "sum")
+    ).reset_index()
+    ceyrek_grp["anapara_risk_m"] = (ceyrek_grp["anapara_risk"] / 1e6).round(1)
+    ceyrek_grp["faiz_risk_m"] = (ceyrek_grp["faiz_risk"] / 1e6).round(1)
+    fig = go.Figure()
+    fig.add_trace(go.Bar(name="Anapara", x=ceyrek_grp["ceyrek"], y=ceyrek_grp["anapara_risk_m"], marker_color="#EF553B"))
+    fig.add_trace(go.Bar(name="Faiz", x=ceyrek_grp["ceyrek"], y=ceyrek_grp["faiz_risk_m"], marker_color="#636EFA"))
+    fig.update_layout(barmode="stack", height=400, xaxis_tickangle=-45, yaxis_title="Milyon TL")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+
+    # Kredi detay tablosu
+    st.subheader("Kredi Risk Detaylari")
+    st.dataframe(
+        df[["krd_id", "mno", "anapara_risk", "faiz_risk", "pb", "valor", "vade",
+            "krd_program", "odeme_sablonu", "yapilandirma"]].sort_values("anapara_risk", ascending=False),
+        use_container_width=True, height=400
+    )
 
 
 # ============================================================
@@ -530,6 +1058,12 @@ def page_limit():
 pages = {
     "ana_sayfa": page_ana_sayfa,
     "kredi": page_kredi,
+    "kredi_kull_region": page_kredi_kull_region,
+    "kredi_kull_sube": page_kredi_kull_sube,
+    "kredi_kull_portfoy": page_kredi_kull_portfoy,
+    "kredi_risk_region": page_kredi_risk_region,
+    "kredi_risk_sube": page_kredi_risk_sube,
+    "kredi_risk_portfoy": page_kredi_risk_portfoy,
     "teminat": page_teminat,
     "hazine": page_hazine,
     "limit": page_limit,

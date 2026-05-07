@@ -27,7 +27,19 @@ PORTFOY_ISIMLERI = [
     "Ahmet Yilmaz", "Mehmet Kaya", "Ayse Demir", "Fatma Celik", "Ali Sahin",
     "Hasan Yildiz", "Huseyin Ozturk", "Zeynep Arslan", "Elif Dogan", "Murat Kilic",
     "Emre Aksoy", "Burak Korkmaz", "Selin Ozkan", "Derya Acar", "Canan Polat",
+    "Oguz Tan",
 ]
+
+SUBE_PORTFOY_MAP = {
+    "Istanbul":  ["Ahmet Yilmaz", "Mehmet Kaya"],
+    "Bursa":     ["Ayse Demir", "Fatma Celik"],
+    "Ankara":    ["Ali Sahin", "Hasan Yildiz"],
+    "Izmir":     ["Huseyin Ozturk", "Zeynep Arslan"],
+    "Konya":     ["Elif Dogan", "Murat Kilic"],
+    "Erzurum":   ["Emre Aksoy", "Burak Korkmaz"],
+    "Trabzon":   ["Selin Ozkan", "Derya Acar"],
+    "Manisa":    ["Canan Polat", "Oguz Tan"],
+}
 
 PARA_BIRIMLERI = ["USD", "EUR", "TRY", "CNY"]
 
@@ -61,13 +73,16 @@ VALOR_END = datetime(2026, 3, 1)
 mnos = sorted(random.sample(range(4200, 42001), NUM_CUSTOMERS))
 unvanlar = list({fake.company() for _ in range(NUM_CUSTOMERS * 3)})[:NUM_CUSTOMERS]
 
+_subeler_list = [random.choice(SUBELER) for _ in range(NUM_CUSTOMERS)]
+_portfoy_list = [random.choice(SUBE_PORTFOY_MAP[s]) for s in _subeler_list]
+
 dim_customer = pd.DataFrame({
     "mno": mnos,
     "unvan": unvanlar[:NUM_CUSTOMERS],
     "kobi_flg": [random.choice([0, 1]) for _ in range(NUM_CUSTOMERS)],
     "kurulus_year": [random.randint(1980, 2020) for _ in range(NUM_CUSTOMERS)],
-    "sube": [random.choice(SUBELER) for _ in range(NUM_CUSTOMERS)],
-    "portfoy": [random.choice(PORTFOY_ISIMLERI) for _ in range(NUM_CUSTOMERS)],
+    "sube": _subeler_list,
+    "portfoy": _portfoy_list,
 })
 dim_customer["region"] = dim_customer["sube"].map(REGION_MAP)
 
