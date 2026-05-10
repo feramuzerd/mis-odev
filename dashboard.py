@@ -5,6 +5,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from datetime import datetime, timedelta
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import MinMaxScaler
 
 st.set_page_config(page_title="MIS Dashboard", layout="wide")
 
@@ -37,6 +39,35 @@ risk_full = risk.merge(credit[["krd_id", "krd_program", "odeme_sablonu", "yapila
 risk_full = risk_full.merge(customer[["mno", "kobi_flg", "sube", "portfoy", "region"]], on="mno", how="left")
 risk_full["valor_dt"] = pd.to_datetime(risk_full["valor"])
 risk_full["ceyrek"] = risk_full["valor_dt"].dt.to_period("Q").astype(str)
+
+# ============================================================
+# PD MODELi - Temerr\u00fct Riski Skoru (Lojistik Regresyon)
+# ============================================================
+@st.cache_data
+def compute_pd_scores(_customer, _credit, _risk):
+    merged = _risk.merge(_credit[["krd_id", "krd_program", "yapilandirma"]], on="krd_id", how="left")
+    merged = merged.merge(_customer[["mno", "kobi_flg", "kurulus_year", "region"]], on="mno", how="left")
+    cust_agg = merged.groupby("mno").agg(
+        kobi_flg=("kobi_flg", "first"),
+        kurulus_year=("kurulus_year", "first"),
+        region=("region", "first"),
+        lcy_tutar=("lcy_tutar", "sum"),
+        yapilandirma_count=("yapilandirma", "sum"),
+        kredi_adet=("krd_id", "count"),
+    ).reset_index()
+    region_dummies = pd.get_dummies(cust_agg["region"], prefix="region")
+    features = pd.concat([cust_agg[["kobi_flg", "kurulus_year", "lcy_tutar"]], region_dummies], axis=1)
+    yapilandirma_oran = cust_agg["yapilandirma_count"] / cust_agg["kredi_adet"]
+    y = (yapilandirma_oran > yapilandirma_oran.median()).astype(int)
+    scaler = MinMaxScaler()
+    X_scaled = scaler.fit_transform(features.values)
+    model = LogisticRegression(max_iter=1000, random_state=42)
+    model.fit(X_scaled, y)
+    proba = model.predict_proba(X_scaled)[:, 1]
+    cust_agg["pd_skor"] = (proba * 100).round(1)
+    return cust_agg[["mno", "pd_skor"]]
+
+pd_scores = compute_pd_scores(customer, credit, risk)
 
 # ============================================================
 # NAVIGATION
@@ -130,6 +161,14 @@ def page_ana_sayfa():
     with row2[2]:
         if st.button("LIMIT", use_container_width=True, key="btn_limit"):
             go_to("limit")
+            st.rerun()
+
+    st.markdown("<div style='height:40px'></div>", unsafe_allow_html=True)
+
+    row3 = st.columns([1, 0.3, 1])
+    with row3[1]:
+        if st.button("MUSTERI", use_container_width=True, key="btn_musteri"):
+            go_to("musteri")
             st.rerun()
 
 
@@ -441,6 +480,185 @@ def page_kredi():
             st.dataframe(tablo, use_container_width=True, hide_index=True)
     else:
         st.info("Gelecek donemde odeme bulunamadi.")
+
+    st.markdown("---")
+
+    # 6. Kredi Teklif Onerileri (Next Best Action)
+    st.subheader("Kredi Teklif Onerileri")
+    st.caption("Bos limiti yuksek ve PD skoru %50'den dusuk (guvenilir) musterilere yeni urun onerisi")
+
+    # genel_limit - anapara_risk = bos_limit
+    cust_risk_agg = risk.groupby("mno")["anapara_risk"].sum().reset_index().rename(
+        columns={"anapara_risk": "toplam_risk"})
+    nba_df = cust_limit[["mno", "genel_limit"]].merge(cust_risk_agg, on="mno", how="left")
+    nba_df["toplam_risk"] = nba_df["toplam_risk"].fillna(0)
+    nba_df["bos_limit"] = nba_df["genel_limit"] - nba_df["toplam_risk"]
+    nba_df = nba_df.merge(customer[["mno", "unvan", "kobi_flg", "sube", "region"]], on="mno", how="left")
+    nba_df = nba_df.merge(pd_scores, on="mno", how="left").dropna(subset=["pd_skor"])
+
+    # Musterinin kullandigi kredi programlari
+    cust_prog = credit.groupby("mno")["krd_program"].agg(
+        lambda x: x.mode().iloc[0] if len(x) > 0 else "").reset_index()
+    cust_prog.columns = ["mno", "mevcut_program"]
+    cust_prog_list = credit.groupby("mno")["krd_program"].apply(set).reset_index()
+    cust_prog_list.columns = ["mno", "program_seti"]
+    nba_df = nba_df.merge(cust_prog, on="mno", how="left")
+    nba_df = nba_df.merge(cust_prog_list, on="mno", how="left")
+
+    # Filtre: PD < 20 ve bos_limit > 0
+    guvenilir = nba_df[(nba_df["pd_skor"] < 50) & (nba_df["bos_limit"] > 0)].copy()
+
+    PROG_LABEL = {"isletme_kredi": "Isletme Kredisi", "yatirim_kredi": "Yatirim Kredisi",
+                   "reeskont": "Reeskont"}
+
+    # Son ay USD kuru (reeskont limiti icin)
+    _son_ay = currency["ay"].max()
+    _usd_kur = currency[(currency["pb1"] == "USD") & (currency["ay"] == _son_ay)]["rate"].values[0]
+    reeskont_limit_tl = 1_000_000 * _usd_kur
+
+    # --- TAB: Kredi Teklifi vs Reeskont Teklifi ---
+    tab_kredi, tab_reeskont = st.tabs(["Kredi Teklifi (Isletme / Yatirim)", "Reeskont Teklifi"])
+
+    # ========== TAB 1: KREDI TEKLIFI ==========
+    with tab_kredi:
+        # Cross-sell: isletme -> yatirim, yatirim -> isletme
+        ONERI_MAP = {
+            "isletme_kredi": "Yatirim Kredisi",
+            "yatirim_kredi": "Isletme Kredisi",
+            "reeskont": "Yatirim Kredisi",
+        }
+        kredi_teklif = guvenilir.copy()
+        kredi_teklif["oneri"] = kredi_teklif["mevcut_program"].map(ONERI_MAP).fillna("Isletme Kredisi")
+
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Toplam Musteri", f"{len(nba_df):,}")
+        k2.metric("Guvenilir (PD<%50)", f"{len(guvenilir):,}")
+        k3.metric("Kredi Teklif Hazir", f"{len(kredi_teklif):,}")
+
+        # Scatter
+        nba_plot = nba_df.copy()
+        nba_plot["durum"] = ((nba_plot["pd_skor"] < 50) & (nba_plot["bos_limit"] > 0)).map(
+            {True: "Teklif Hazir", False: "Uygun Degil"})
+        fig = px.scatter(nba_plot, x="bos_limit", y="pd_skor", color="durum",
+                         color_discrete_map={"Teklif Hazir": "#00CC96", "Uygun Degil": "#ABB2B9"},
+                         hover_data=["mno", "unvan", "sube"],
+                         labels={"bos_limit": "Bos Limit (TL)", "pd_skor": "PD Skoru (%)", "durum": ""},
+                         opacity=0.7)
+        fig.add_hline(y=50, line_dash="dash", line_color="red", annotation_text="PD Esigi (%50)")
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+
+        if len(kredi_teklif) > 0:
+            kt = kredi_teklif.copy()
+            kt["bos_limit_m"] = (kt["bos_limit"] / 1e6).round(2)
+            kt["genel_limit_m"] = (kt["genel_limit"] / 1e6).round(2)
+            kt["toplam_risk_m"] = (kt["toplam_risk"] / 1e6).round(2)
+            kt["kobi_label"] = kt["kobi_flg"].map({0: "Kurumsal", 1: "KOBi"})
+            kt["mevcut"] = kt["mevcut_program"].map(PROG_LABEL)
+            kt = kt.sort_values("bos_limit", ascending=False)
+
+            st.dataframe(
+                kt[["mno", "unvan", "sube", "region", "kobi_label",
+                    "genel_limit_m", "toplam_risk_m", "bos_limit_m",
+                    "pd_skor", "mevcut", "oneri"]]
+                .rename(columns={
+                    "mno": "MNO", "unvan": "Unvan", "sube": "Sube", "region": "Bolge",
+                    "kobi_label": "Segment", "genel_limit_m": "Genel Limit (M)",
+                    "toplam_risk_m": "Risk (M)", "bos_limit_m": "Bos Limit (M)",
+                    "pd_skor": "PD (%)", "mevcut": "Mevcut Program", "oneri": "Urun Onerisi"
+                }),
+                use_container_width=True, height=400
+            )
+
+            c1, c2 = st.columns(2)
+            with c1:
+                oneri_grp = kt.groupby("oneri").agg(
+                    musteri=("mno", "count"), potansiyel=("bos_limit", "sum")).reset_index()
+                oneri_grp["potansiyel_m"] = (oneri_grp["potansiyel"] / 1e6).round(1)
+                fig = px.bar(oneri_grp, x="oneri", y="musteri",
+                             labels={"oneri": "Oneri", "musteri": "Musteri Sayisi"},
+                             color="oneri", text="musteri")
+                fig.update_traces(textposition="outside")
+                fig.update_layout(height=350, showlegend=False, title="Urun Onerisine Gore Musteri")
+                st.plotly_chart(fig, use_container_width=True)
+            with c2:
+                fig = px.bar(oneri_grp, x="oneri", y="potansiyel_m",
+                             labels={"oneri": "Oneri", "potansiyel_m": "Potansiyel (M TL)"},
+                             color="oneri", text="potansiyel_m")
+                fig.update_traces(textposition="outside")
+                fig.update_layout(height=350, showlegend=False, title="Potansiyel Hacim")
+                st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Uygun kredi teklif musterisi bulunamadi.")
+
+    # ========== TAB 2: REESKONT TEKLIFI ==========
+    with tab_reeskont:
+        st.caption(f"Guvenilir (PD<%50), bos limiti olan musteriler. "
+                   f"Maks. 1M USD ({reeskont_limit_tl/1e6:,.2f} M TL)")
+
+        # Tum guvenilir musteriler
+        reeskont_teklif = guvenilir.copy()
+
+        # Reeskont tutari: bos_limit ile 1M USD limitinin kucugu
+        reeskont_teklif["reeskont_tutar"] = reeskont_teklif["bos_limit"].values.clip(max=reeskont_limit_tl)
+        reeskont_teklif = reeskont_teklif[reeskont_teklif["reeskont_tutar"] > 0].sort_values(
+            "reeskont_tutar", ascending=False)
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Guvenilir Musteri", f"{len(guvenilir):,}")
+        k2.metric("Teklif Hazir", f"{len(reeskont_teklif):,}")
+        k3.metric("Maks Tutar (1M USD)", f"{reeskont_limit_tl/1e6:,.2f} M TL")
+        k4.metric("Toplam Potansiyel", f"{reeskont_teklif['reeskont_tutar'].sum()/1e6:,.1f} M TL")
+
+        if len(reeskont_teklif) > 0:
+            rt = reeskont_teklif.copy()
+            rt["reeskont_m"] = (rt["reeskont_tutar"] / 1e6).round(2)
+            rt["reeskont_usd"] = (rt["reeskont_tutar"] / _usd_kur / 1000).round(1)
+            rt["bos_limit_m"] = (rt["bos_limit"] / 1e6).round(2)
+            rt["genel_limit_m"] = (rt["genel_limit"] / 1e6).round(2)
+            rt["toplam_risk_m"] = (rt["toplam_risk"] / 1e6).round(2)
+            rt["kobi_label"] = rt["kobi_flg"].map({0: "Kurumsal", 1: "KOBi"})
+            rt["mevcut"] = rt["mevcut_program"].map(PROG_LABEL)
+
+            st.dataframe(
+                rt[["mno", "unvan", "sube", "region", "kobi_label",
+                    "genel_limit_m", "toplam_risk_m", "bos_limit_m",
+                    "pd_skor", "mevcut", "reeskont_m", "reeskont_usd"]]
+                .rename(columns={
+                    "mno": "MNO", "unvan": "Unvan", "sube": "Sube", "region": "Bolge",
+                    "kobi_label": "Segment", "genel_limit_m": "Genel Limit (M)",
+                    "toplam_risk_m": "Risk (M)", "bos_limit_m": "Bos Limit (M)",
+                    "pd_skor": "PD (%)", "mevcut": "Mevcut Program",
+                    "reeskont_m": "Reeskont Teklif (M TL)", "reeskont_usd": "Reeskont (Bin USD)"
+                }),
+                use_container_width=True, height=400
+            )
+
+            c1, c2 = st.columns(2)
+            with c1:
+                bolge_re = rt.groupby("region").agg(
+                    musteri=("mno", "count"), potansiyel=("reeskont_tutar", "sum")).reset_index()
+                bolge_re["potansiyel_m"] = (bolge_re["potansiyel"] / 1e6).round(1)
+                fig = px.bar(bolge_re.sort_values("potansiyel_m", ascending=True),
+                             x="potansiyel_m", y="region", orientation="h",
+                             labels={"region": "Bolge", "potansiyel_m": "Potansiyel (M TL)"},
+                             color="region", text="potansiyel_m",
+                             title="Bolge Bazinda Reeskont Potansiyeli")
+                fig.update_traces(textposition="outside")
+                fig.update_layout(height=400, showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+            with c2:
+                seg_re = rt.groupby("kobi_label").agg(
+                    musteri=("mno", "count"), potansiyel=("reeskont_tutar", "sum")).reset_index()
+                seg_re["potansiyel_m"] = (seg_re["potansiyel"] / 1e6).round(1)
+                fig = px.pie(seg_re, values="musteri", names="kobi_label",
+                             title="Segment Bazinda Reeskont Dagilimi", hole=0.4,
+                             color="kobi_label",
+                             color_discrete_map={"KOBi": "#00CC96", "Kurumsal": "#AB63FA"})
+                fig.update_layout(height=400)
+                st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Uygun reeskont teklif musterisi bulunamadi.")
 
 
 # ============================================================
@@ -1062,6 +1280,161 @@ def page_hazine():
     fig.update_layout(height=500, yaxis_title="Kur (TL)", xaxis_title="")
     st.plotly_chart(fig, use_container_width=True)
 
+    st.markdown("---")
+
+    # 3. Stress Testing - Kredi Riski Bazli
+    st.subheader("Stress Testing - Kur Senaryosu (Kredi Riski Bazli)")
+    st.caption("Musterilerin nakit akislari TL cinsindendir. Yabanci para kredilerde kur artisi, "
+               "TL cinsinden kredi riskini arttirir. TL krediler kurdan etkilenmez.")
+
+    # Son ay kurlari
+    usd_kur = son_kurlar[son_kurlar["pb1"] == "USD"]["rate"].values[0]
+    eur_kur = son_kurlar[son_kurlar["pb1"] == "EUR"]["rate"].values[0]
+    cny_kur = son_kurlar[son_kurlar["pb1"] == "CNY"]["rate"].values[0]
+
+    kur_artis = st.slider("Kur Artis Orani (%)", min_value=0, max_value=100, value=20, step=5,
+                           key="stress_slider")
+    kur_carpan = 1 + kur_artis / 100
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("USD/TRY", f"{usd_kur:,.2f} -> {usd_kur*kur_carpan:,.2f}")
+    k2.metric("EUR/TRY", f"{eur_kur:,.2f} -> {eur_kur*kur_carpan:,.2f}")
+    k3.metric("CNY/TRY", f"{cny_kur:,.2f} -> {cny_kur*kur_carpan:,.2f}")
+    k4.metric("Carpan", f"x{kur_carpan:.2f}", delta=f"+%{kur_artis}")
+
+    # Kredi bazinda stress hesapla
+    # risk tablosundaki her krediyi para birimiyle eslestir
+    stress_kr = risk[["krd_id", "mno", "anapara_risk", "pb"]].copy()
+
+    # Kur senaryosu: yabanci para kredilerin TL riski kur oraniyla artar, TL krediler sabit kalir
+    stress_kr["stress_risk"] = stress_kr.apply(
+        lambda r: r["anapara_risk"] * kur_carpan if r["pb"] != "TRY" else r["anapara_risk"], axis=1)
+
+    # Musteri bazinda topla
+    cust_stress = stress_kr.groupby("mno").agg(
+        mevcut_risk=("anapara_risk", "sum"),
+        senaryo_risk=("stress_risk", "sum"),
+        yp_kredi_adet=("pb", lambda x: (x != "TRY").sum()),
+        toplam_kredi=("krd_id", "count"),
+    ).reset_index()
+
+    # Teminat eslestir
+    cust_teminat = collateral.groupby("cust_id")["tutar"].sum().reset_index().rename(
+        columns={"cust_id": "mno", "tutar": "teminat_tutari"})
+    cust_stress = cust_stress.merge(cust_teminat, on="mno", how="left").fillna({"teminat_tutari": 0})
+    cust_stress = cust_stress.merge(customer[["mno", "unvan", "sube", "region"]], on="mno", how="left")
+
+    cust_stress["risk_artis"] = cust_stress["senaryo_risk"] - cust_stress["mevcut_risk"]
+    cust_stress["teminat_acigi"] = cust_stress["senaryo_risk"] > cust_stress["teminat_tutari"]
+    cust_stress["acik_tutar"] = (cust_stress["senaryo_risk"] - cust_stress["teminat_tutari"]).clip(lower=0)
+
+    # Mevcut durumda da acikta olanlar vs senaryoda yeni aciga dusenler
+    cust_stress["mevcut_acik"] = cust_stress["mevcut_risk"] > cust_stress["teminat_tutari"]
+
+    acikli = cust_stress[cust_stress["teminat_acigi"]]
+    yeni_acikli = cust_stress[cust_stress["teminat_acigi"] & ~cust_stress["mevcut_acik"]]
+    toplam_musteri = len(cust_stress)
+    acikli_sayi = len(acikli)
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Toplam Musteri", f"{toplam_musteri:,}")
+    k2.metric("Teminat Acigi (Senaryo)", f"{acikli_sayi:,}")
+    k3.metric("Yeni Aciga Dusen", f"{len(yeni_acikli):,}",
+              delta=f"+{len(yeni_acikli)}" if len(yeni_acikli) > 0 else "0")
+    k4.metric("Risk Artisi", f"{cust_stress['risk_artis'].sum()/1e6:,.1f} M TL")
+
+    # Kur artisina gore etkilenen musteri sayisi grafigi
+    st.markdown("")
+    artis_araligi = list(range(0, 105, 5))
+    sayilar = []
+    for a in artis_araligi:
+        c = 1 + a / 100
+        senaryo = stress_kr.apply(
+            lambda r: r["anapara_risk"] * c if r["pb"] != "TRY" else r["anapara_risk"], axis=1)
+        senaryo_cust = pd.DataFrame({"mno": stress_kr["mno"], "sr": senaryo}).groupby("mno")["sr"].sum()
+        tem = cust_teminat.set_index("mno")["teminat_tutari"]
+        karsilastir = senaryo_cust.to_frame("sr").join(tem, how="left").fillna(0)
+        cnt = int((karsilastir["sr"] > karsilastir["teminat_tutari"]).sum())
+        sayilar.append({"kur_artis": a, "musteri": cnt})
+    artis_df = pd.DataFrame(sayilar)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=artis_df["kur_artis"], y=artis_df["musteri"],
+        mode="lines+markers+text", text=artis_df["musteri"],
+        textposition="top center",
+        line=dict(color="#EF553B", width=3),
+        fill="tozeroy", fillcolor="rgba(239,85,59,0.1)",
+    ))
+    fig.add_vline(x=kur_artis, line_dash="dash", line_color="blue",
+                  annotation_text=f"Secili: %{kur_artis}")
+    fig.update_layout(height=450, xaxis_title="Kur Artis Orani (%)",
+                      yaxis_title="Teminat Acigi Olan Musteri Sayisi",
+                      title="Kur Artisina Gore Teminat Acigi")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Mevcut vs Senaryo risk karsilastirmasi
+    c1, c2 = st.columns(2)
+    with c1:
+        bolge_stress = cust_stress.groupby("region").agg(
+            mevcut=("mevcut_risk", "sum"), senaryo=("senaryo_risk", "sum")
+        ).reset_index()
+        bolge_stress["mevcut_m"] = (bolge_stress["mevcut"] / 1e6).round(1)
+        bolge_stress["senaryo_m"] = (bolge_stress["senaryo"] / 1e6).round(1)
+        bolge_melt = bolge_stress.melt(id_vars="region", value_vars=["mevcut_m", "senaryo_m"],
+                                        var_name="tip", value_name="tutar")
+        bolge_melt["tip"] = bolge_melt["tip"].map({"mevcut_m": "Mevcut Risk", "senaryo_m": "Senaryo Risk"})
+        fig = px.bar(bolge_melt, x="region", y="tutar", color="tip", barmode="group",
+                     labels={"region": "Bolge", "tutar": "Risk (M TL)", "tip": ""},
+                     color_discrete_map={"Mevcut Risk": "#636EFA", "Senaryo Risk": "#EF553B"},
+                     title="Bolge Bazinda Mevcut vs Senaryo Risk")
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        if len(acikli) > 0:
+            bolge_acik = acikli.groupby("region").agg(
+                musteri_say=("mno", "count"), acik_toplam=("acik_tutar", "sum")
+            ).reset_index()
+            bolge_acik["acik_m"] = (bolge_acik["acik_toplam"] / 1e6).round(1)
+            fig = px.bar(bolge_acik.sort_values("acik_m", ascending=True),
+                         x="acik_m", y="region", orientation="h",
+                         labels={"region": "Bolge", "acik_m": "Acik Tutar (M TL)"},
+                         color="region", text="acik_m",
+                         title="Bolge Bazinda Teminat Acigi")
+            fig.update_traces(textposition="outside")
+            fig.update_layout(height=400, showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+
+    # Detay tablosu
+    with st.expander("Teminat Acigi Detay Tablosu"):
+        tablo = cust_stress.copy()
+        tablo["mevcut_m"] = (tablo["mevcut_risk"] / 1e6).round(2)
+        tablo["senaryo_m"] = (tablo["senaryo_risk"] / 1e6).round(2)
+        tablo["artis_m"] = (tablo["risk_artis"] / 1e6).round(2)
+        tablo["teminat_m"] = (tablo["teminat_tutari"] / 1e6).round(2)
+        tablo["acik_m"] = (tablo["acik_tutar"] / 1e6).round(2)
+        tablo["durum"] = tablo["teminat_acigi"].map({True: "TEMINAT ACIGI", False: "Yeterli"})
+        tablo["yp_oran"] = ((tablo["yp_kredi_adet"] / tablo["toplam_kredi"]) * 100).round(1)
+        tablo = tablo.sort_values("acik_tutar", ascending=False)
+
+        def highlight_acik(row):
+            if row["Durum"] == "TEMINAT ACIGI":
+                return ["background-color: #ffcccc; color: #cc0000; font-weight: bold"] * len(row)
+            return [""] * len(row)
+
+        st.dataframe(
+            tablo[["mno", "unvan", "sube", "region", "mevcut_m", "senaryo_m",
+                   "artis_m", "teminat_m", "acik_m", "yp_oran", "durum"]]
+            .rename(columns={
+                "mno": "MNO", "unvan": "Unvan", "sube": "Sube", "region": "Bolge",
+                "mevcut_m": "Mevcut Risk (M)", "senaryo_m": "Senaryo Risk (M)",
+                "artis_m": "Risk Artisi (M)", "teminat_m": "Teminat (M)",
+                "acik_m": "Acik (M)", "yp_oran": "YP Oran (%)", "durum": "Durum"
+            })
+            .style.apply(highlight_acik, axis=1),
+            use_container_width=True, height=500
+        )
+
 
 # ============================================================
 # LIMIT SAYFASI
@@ -1164,6 +1537,291 @@ def page_limit():
 
 
 # ============================================================
+# MUSTERI SAYFASI
+# ============================================================
+def page_musteri():
+    st.title("Musteri Analizi ve Siniflandirma")
+    back_button()
+
+    # --- Temel musteri verisini zenginlestir ---
+    cust = customer.copy()
+
+    # Kredi hacmi ve kullandirim sikligi
+    cust_kredi = credit.groupby("mno").agg(
+        kredi_adet=("krd_id", "count"),
+        toplam_hacim=("lcy_tutar", "sum"),
+        toplam_usd=("usd_tutar", "sum"),
+    ).reset_index()
+
+    # Odeme performansi: odenen taksit / toplam taksit
+    kredi_taksit = credit[["krd_id", "mno", "odeme_sablonu"]].copy()
+    SABLON_TAKSIT = {
+        "720_gun_4_taksit": 4, "360_gun_2_taksit": 2,
+        "5_yil_9_taksit": 9, "7_yil_9_taksit": 9,
+        "360_gun_tek_taksit": 1,
+    }
+    kredi_taksit["toplam_taksit"] = kredi_taksit["odeme_sablonu"].map(SABLON_TAKSIT)
+    odenen_taksit = payment.groupby("krd_id")["taksit_tutar"].count().reset_index()
+    odenen_taksit.columns = ["krd_id", "odenen_taksit"]
+    kredi_taksit = kredi_taksit.merge(odenen_taksit, on="krd_id", how="left")
+    kredi_taksit["odenen_taksit"] = kredi_taksit["odenen_taksit"].fillna(0)
+    cust_perf = kredi_taksit.groupby("mno").agg(
+        toplam_taksit=("toplam_taksit", "sum"),
+        odenen_taksit=("odenen_taksit", "sum"),
+    ).reset_index()
+    cust_perf["odeme_orani"] = (cust_perf["odenen_taksit"] / cust_perf["toplam_taksit"].replace(0, np.nan) * 100).round(1)
+
+    # Risk
+    cust_risk = risk.groupby("mno")["anapara_risk"].sum().reset_index().rename(
+        columns={"anapara_risk": "toplam_risk"})
+
+    # Birlestir
+    cust = cust.merge(cust_kredi, on="mno", how="left")
+    cust = cust.merge(cust_perf[["mno", "odeme_orani"]], on="mno", how="left")
+    cust = cust.merge(cust_risk, on="mno", how="left")
+    cust = cust.merge(pd_scores, on="mno", how="left")
+    cust["kredi_adet"] = cust["kredi_adet"].fillna(0).astype(int)
+    cust["toplam_hacim"] = cust["toplam_hacim"].fillna(0)
+    cust["toplam_risk"] = cust["toplam_risk"].fillna(0)
+    cust["odeme_orani"] = cust["odeme_orani"].fillna(0)
+    cust["pd_skor"] = cust["pd_skor"].fillna(50)
+
+    # KPI
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Toplam Musteri", f"{len(cust):,}")
+    col2.metric("KOBi", f"{cust['kobi_flg'].sum():,}")
+    col3.metric("Kurumsal", f"{(cust['kobi_flg'] == 0).sum():,}")
+    col4.metric("Ort. PD Skoru", f"%{cust['pd_skor'].mean():.1f}")
+
+    st.markdown("---")
+
+    # ==========================================
+    # 1. TEMEL SINIFLANDIRMA
+    # ==========================================
+    st.subheader("Temel Musteri Siniflandirmasi")
+
+    # Kobi / Kurumsal
+    cust["segment_tip"] = cust["kobi_flg"].map({1: "KOBi", 0: "Kurumsal"})
+
+    # Bolge
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        seg_tip = cust["segment_tip"].value_counts().reset_index()
+        seg_tip.columns = ["Segment", "Adet"]
+        fig = px.pie(seg_tip, values="Adet", names="Segment", title="KOBi / Kurumsal",
+                     hole=0.4, color="Segment",
+                     color_discrete_map={"KOBi": "#00CC96", "Kurumsal": "#AB63FA"})
+        fig.update_layout(height=350)
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        bolge_grp = cust.groupby("region")["mno"].count().reset_index()
+        bolge_grp.columns = ["Bolge", "Adet"]
+        fig = px.pie(bolge_grp, values="Adet", names="Bolge", title="Bolge Dagilimi", hole=0.4)
+        fig.update_layout(height=350)
+        st.plotly_chart(fig, use_container_width=True)
+    with c3:
+        cust["firma_yasi"] = 2026 - cust["kurulus_year"]
+        yas_bins = pd.cut(cust["firma_yasi"], bins=[0, 5, 15, 30, 100],
+                          labels=["0-5 Yil", "6-15 Yil", "16-30 Yil", "30+ Yil"])
+        yas_grp = yas_bins.value_counts().reset_index()
+        yas_grp.columns = ["Grup", "Adet"]
+        fig = px.pie(yas_grp, values="Adet", names="Grup", title="Firma Yasi Dagilimi", hole=0.4)
+        fig.update_layout(height=350)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+
+    # ==========================================
+    # 2. KREDI HACMI SINIFLANDIRMASI
+    # ==========================================
+    st.subheader("Kredi Hacmine Gore Siniflandirma")
+
+    hacim_q = cust[cust["toplam_hacim"] > 0]["toplam_hacim"].quantile([0.33, 0.66])
+    def hacim_sinif(val):
+        if val <= 0:
+            return "Kredisiz"
+        elif val <= hacim_q.iloc[0]:
+            return "Dusuk Hacim"
+        elif val <= hacim_q.iloc[1]:
+            return "Orta Hacim"
+        else:
+            return "Yuksek Hacim"
+    cust["hacim_sinif"] = cust["toplam_hacim"].apply(hacim_sinif)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        hs = cust["hacim_sinif"].value_counts().reset_index()
+        hs.columns = ["Sinif", "Adet"]
+        fig = px.bar(hs, x="Sinif", y="Adet", color="Sinif", text="Adet",
+                     color_discrete_map={"Kredisiz": "#ABB2B9", "Dusuk Hacim": "#636EFA",
+                                         "Orta Hacim": "#FFA15A", "Yuksek Hacim": "#00CC96"},
+                     title="Hacim Sinifi Dagilimi")
+        fig.update_traces(textposition="outside")
+        fig.update_layout(height=400, showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        hacim_bolge = cust[cust["toplam_hacim"] > 0].groupby(["region", "hacim_sinif"])["mno"].count().reset_index()
+        hacim_bolge.columns = ["Bolge", "Sinif", "Adet"]
+        fig = px.bar(hacim_bolge, x="Bolge", y="Adet", color="Sinif", barmode="stack",
+                     color_discrete_map={"Dusuk Hacim": "#636EFA", "Orta Hacim": "#FFA15A",
+                                         "Yuksek Hacim": "#00CC96"},
+                     title="Bolge Bazinda Hacim Sinifi")
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+
+    # ==========================================
+    # 3. KULLANDIRIM SIKLIGI SINIFLANDIRMASI
+    # ==========================================
+    st.subheader("Kredi Kullandirim Sikligina Gore Siniflandirma")
+
+    def siklik_sinif(adet):
+        if adet == 0:
+            return "Kredisiz"
+        elif adet <= 10:
+            return "Dusuk Siklik"
+        elif adet <= 30:
+            return "Orta Siklik"
+        else:
+            return "Yuksek Siklik"
+    cust["siklik_sinif"] = cust["kredi_adet"].apply(siklik_sinif)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        ss = cust["siklik_sinif"].value_counts().reset_index()
+        ss.columns = ["Sinif", "Adet"]
+        fig = px.pie(ss, values="Adet", names="Sinif", title="Siklik Sinifi Dagilimi",
+                     hole=0.4, color="Sinif",
+                     color_discrete_map={"Kredisiz": "#ABB2B9", "Dusuk Siklik": "#636EFA",
+                                         "Orta Siklik": "#FFA15A", "Yuksek Siklik": "#00CC96"})
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        fig = px.histogram(cust[cust["kredi_adet"] > 0], x="kredi_adet", nbins=20,
+                           labels={"kredi_adet": "Kredi Adedi", "count": "Musteri Sayisi"},
+                           color_discrete_sequence=["#636EFA"], title="Kredi Adedi Dagilimi")
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+
+    # ==========================================
+    # 4. ODEME PERFORMANSI SINIFLANDIRMASI
+    # ==========================================
+    st.subheader("Odeme Performansina Gore Siniflandirma")
+
+    def perf_sinif(oran):
+        if oran >= 80:
+            return "Cok Iyi"
+        elif oran >= 50:
+            return "Iyi"
+        elif oran >= 20:
+            return "Orta"
+        else:
+            return "Zayif"
+    cust["perf_sinif"] = cust["odeme_orani"].apply(perf_sinif)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        ps = cust["perf_sinif"].value_counts().reset_index()
+        ps.columns = ["Sinif", "Adet"]
+        fig = px.bar(ps, x="Sinif", y="Adet", color="Sinif", text="Adet",
+                     color_discrete_map={"Cok Iyi": "#00CC96", "Iyi": "#636EFA",
+                                         "Orta": "#FFA15A", "Zayif": "#EF553B"},
+                     title="Odeme Performansi Dagilimi")
+        fig.update_traces(textposition="outside")
+        fig.update_layout(height=400, showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        fig = px.histogram(cust[cust["odeme_orani"] > 0], x="odeme_orani", nbins=20,
+                           labels={"odeme_orani": "Odeme Orani (%)", "count": "Musteri Sayisi"},
+                           color_discrete_sequence=["#00CC96"], title="Odeme Orani Dagilimi")
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+
+    # ==========================================
+    # 5. PD - TEMERR\u00dcT RISKI SINIFLANDIRMASI
+    # ==========================================
+    st.subheader("Tahmini Temerr\u00fct Ihtimali (PD Skoru)")
+    st.caption("Lojistik Regresyon modeli: kobi_flg, kurulus_year, region, lcy_tutar feature'lari ile "
+               "0-100 arasi risk skoru. %70 uzeri kirmizi ile isaretlenir.")
+
+    def pd_sinif(skor):
+        if skor < 20:
+            return "Dusuk Risk"
+        elif skor < 50:
+            return "Orta Risk"
+        elif skor < 70:
+            return "Yuksek Risk"
+        else:
+            return "Kritik Risk"
+    cust["pd_sinif"] = cust["pd_skor"].apply(pd_sinif)
+
+    # PD KPI
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Dusuk Risk (<20)", f"{(cust['pd_skor'] < 20).sum():,}")
+    k2.metric("Orta Risk (20-50)", f"{((cust['pd_skor'] >= 20) & (cust['pd_skor'] < 50)).sum():,}")
+    k3.metric("Yuksek Risk (50-70)", f"{((cust['pd_skor'] >= 50) & (cust['pd_skor'] < 70)).sum():,}")
+    k4.metric("Kritik Risk (>=70)", f"{(cust['pd_skor'] >= 70).sum():,}")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.histogram(cust, x="pd_skor", nbins=25,
+                           labels={"pd_skor": "PD Skoru (%)", "count": "Musteri Sayisi"},
+                           color_discrete_sequence=["#636EFA"], title="PD Skor Dagilimi")
+        fig.add_vline(x=70, line_dash="dash", line_color="red", annotation_text="Tehlike Esigi (%70)")
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        pd_grp = cust["pd_sinif"].value_counts().reset_index()
+        pd_grp.columns = ["Grup", "Adet"]
+        fig = px.pie(pd_grp, values="Adet", names="Grup", title="PD Risk Grubu Dagilimi",
+                     hole=0.4, color="Grup",
+                     color_discrete_map={"Dusuk Risk": "#00CC96", "Orta Risk": "#636EFA",
+                                         "Yuksek Risk": "#FFA15A", "Kritik Risk": "#EF553B"})
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+
+    # ==========================================
+    # 6. DETAY TABLOSU
+    # ==========================================
+    st.subheader("Musteri Detay Tablosu")
+
+    tablo = cust[["mno", "unvan", "segment_tip", "sube", "region", "kurulus_year",
+                   "kredi_adet", "toplam_hacim", "odeme_orani", "toplam_risk", "pd_skor",
+                   "hacim_sinif", "siklik_sinif", "perf_sinif", "pd_sinif"]].copy()
+    tablo["toplam_hacim_m"] = (tablo["toplam_hacim"] / 1e6).round(2)
+    tablo["toplam_risk_m"] = (tablo["toplam_risk"] / 1e6).round(2)
+    tablo = tablo.sort_values("pd_skor", ascending=False)
+
+    def highlight_pd(row):
+        if row["PD (%)"] >= 70:
+            return ["background-color: #ffcccc; color: #cc0000; font-weight: bold"] * len(row)
+        return [""] * len(row)
+
+    st.dataframe(
+        tablo[["mno", "unvan", "segment_tip", "sube", "region", "kredi_adet",
+               "toplam_hacim_m", "odeme_orani", "toplam_risk_m", "pd_skor",
+               "hacim_sinif", "siklik_sinif", "perf_sinif", "pd_sinif"]]
+        .rename(columns={
+            "mno": "MNO", "unvan": "Unvan", "segment_tip": "Tip", "sube": "Sube",
+            "region": "Bolge", "kredi_adet": "Kredi Adet",
+            "toplam_hacim_m": "Hacim (M TL)", "odeme_orani": "Odeme (%)",
+            "toplam_risk_m": "Risk (M TL)", "pd_skor": "PD (%)",
+            "hacim_sinif": "Hacim Sinifi", "siklik_sinif": "Siklik Sinifi",
+            "perf_sinif": "Performans", "pd_sinif": "PD Sinifi"
+        })
+        .style.apply(highlight_pd, axis=1),
+        use_container_width=True, height=600
+    )
+
+
+# ============================================================
 # ROUTING
 # ============================================================
 pages = {
@@ -1178,6 +1836,7 @@ pages = {
     "teminat": page_teminat,
     "hazine": page_hazine,
     "limit": page_limit,
+    "musteri": page_musteri,
 }
 
 pages[st.session_state.page]()
