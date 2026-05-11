@@ -96,20 +96,23 @@ def go_to(page, region=None, sube=None, portfoy=None):
 def render_filters(df, prefix="main"):
     st.sidebar.markdown("### Filtreler")
 
+    # Filtre secenekleri her zaman customer tablosundan (tutarlilik icin)
+    ref = customer.copy()
+
     # Once bolge secilir, diger filtreler buna gore daraltilir
-    bolge = st.sidebar.multiselect("Bolge", sorted(df["region"].unique()), key=f"{prefix}_bolge")
-    df_after_bolge = df[df["region"].isin(bolge)] if bolge else df
+    bolge = st.sidebar.multiselect("Bolge", sorted(ref["region"].unique()), key=f"{prefix}_bolge")
+    ref_after_bolge = ref[ref["region"].isin(bolge)] if bolge else ref
 
     kobi = st.sidebar.multiselect("KOBi Durumu",
-                                  sorted(df_after_bolge["kobi_flg"].unique()),
+                                  sorted(ref_after_bolge["kobi_flg"].unique()),
                                   format_func=lambda x: "KOBi" if x == 1 else "Kurumsal",
                                   key=f"{prefix}_kobi")
-    df_after_kobi = df_after_bolge[df_after_bolge["kobi_flg"].isin(kobi)] if kobi else df_after_bolge
+    ref_after_kobi = ref_after_bolge[ref_after_bolge["kobi_flg"].isin(kobi)] if kobi else ref_after_bolge
 
-    sube = st.sidebar.multiselect("Sube", sorted(df_after_kobi["sube"].unique()), key=f"{prefix}_sube")
-    df_after_sube = df_after_kobi[df_after_kobi["sube"].isin(sube)] if sube else df_after_kobi
+    sube = st.sidebar.multiselect("Sube", sorted(ref_after_kobi["sube"].unique()), key=f"{prefix}_sube")
+    ref_after_sube = ref_after_kobi[ref_after_kobi["sube"].isin(sube)] if sube else ref_after_kobi
 
-    portfoy = st.sidebar.multiselect("Portfoy", sorted(df_after_sube["portfoy"].unique()), key=f"{prefix}_portfoy")
+    portfoy = st.sidebar.multiselect("Portfoy", sorted(ref_after_sube["portfoy"].unique()), key=f"{prefix}_portfoy")
 
     mask = pd.Series(True, index=df.index)
     if bolge:
