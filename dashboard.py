@@ -95,20 +95,31 @@ def go_to(page, region=None, sube=None, portfoy=None):
 # ============================================================
 def render_filters(df, prefix="main"):
     st.sidebar.markdown("### Filtreler")
-    portfoy = st.sidebar.multiselect("Portfoy", sorted(df["portfoy"].unique()), key=f"{prefix}_portfoy")
-    sube = st.sidebar.multiselect("Sube", sorted(df["sube"].unique()), key=f"{prefix}_sube")
+
+    # Once bolge secilir, diger filtreler buna gore daraltilir
     bolge = st.sidebar.multiselect("Bolge", sorted(df["region"].unique()), key=f"{prefix}_bolge")
-    kobi = st.sidebar.multiselect("KOBi Durumu", [0, 1], format_func=lambda x: "KOBi" if x == 1 else "Kurumsal", key=f"{prefix}_kobi")
+    df_after_bolge = df[df["region"].isin(bolge)] if bolge else df
+
+    kobi = st.sidebar.multiselect("KOBi Durumu",
+                                  sorted(df_after_bolge["kobi_flg"].unique()),
+                                  format_func=lambda x: "KOBi" if x == 1 else "Kurumsal",
+                                  key=f"{prefix}_kobi")
+    df_after_kobi = df_after_bolge[df_after_bolge["kobi_flg"].isin(kobi)] if kobi else df_after_bolge
+
+    sube = st.sidebar.multiselect("Sube", sorted(df_after_kobi["sube"].unique()), key=f"{prefix}_sube")
+    df_after_sube = df_after_kobi[df_after_kobi["sube"].isin(sube)] if sube else df_after_kobi
+
+    portfoy = st.sidebar.multiselect("Portfoy", sorted(df_after_sube["portfoy"].unique()), key=f"{prefix}_portfoy")
 
     mask = pd.Series(True, index=df.index)
-    if portfoy:
-        mask &= df["portfoy"].isin(portfoy)
-    if sube:
-        mask &= df["sube"].isin(sube)
     if bolge:
         mask &= df["region"].isin(bolge)
     if kobi:
         mask &= df["kobi_flg"].isin(kobi)
+    if sube:
+        mask &= df["sube"].isin(sube)
+    if portfoy:
+        mask &= df["portfoy"].isin(portfoy)
     return mask
 
 def back_button(target="ana_sayfa", label="Ana Sayfaya Don", **kwargs):
@@ -493,8 +504,18 @@ def page_kredi():
     nba_df = cust_limit[["mno", "genel_limit"]].merge(cust_risk_agg, on="mno", how="left")
     nba_df["toplam_risk"] = nba_df["toplam_risk"].fillna(0)
     nba_df["bos_limit"] = nba_df["genel_limit"] - nba_df["toplam_risk"]
-    nba_df = nba_df.merge(customer[["mno", "unvan", "kobi_flg", "sube", "region"]], on="mno", how="left")
+    nba_df = nba_df.merge(customer[["mno", "unvan", "kobi_flg", "sube", "portfoy", "region"]], on="mno", how="left")
     nba_df = nba_df.merge(pd_scores, on="mno", how="left").dropna(subset=["pd_skor"])
+
+    # Sidebar filtrelerini uygula
+    if st.session_state.get("kredi_portfoy"):
+        nba_df = nba_df[nba_df["portfoy"].isin(st.session_state["kredi_portfoy"])]
+    if st.session_state.get("kredi_sube"):
+        nba_df = nba_df[nba_df["sube"].isin(st.session_state["kredi_sube"])]
+    if st.session_state.get("kredi_bolge"):
+        nba_df = nba_df[nba_df["region"].isin(st.session_state["kredi_bolge"])]
+    if st.session_state.get("kredi_kobi"):
+        nba_df = nba_df[nba_df["kobi_flg"].isin(st.session_state["kredi_kobi"])]
 
     # Musterinin kullandigi kredi programlari
     cust_prog = credit.groupby("mno")["krd_program"].agg(
